@@ -55,8 +55,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="Run BoaConstrictor experiments from a config file")
     p.add_argument('--config', '-c', type=Path, required=False, help='Path to YAML experiment config')
     p.add_argument('--no-progress', action='store_true', help='Disable progress bars')
-    p.add_argument('--device', type=str, default="cuda", help='Torch device override (cpu|cuda)')
-    p.add_argument('--precision', type=str, default="fp32", choices=['fp32','fp16', 'fp8'], help='Precision override')
+    p.add_argument('--device', type=str, default=None, help='Torch device override (cpu|cuda)')
+    p.add_argument('--precision', type=str, default=None, help='Precision override')
     p.add_argument('--new-experiment', action='store_true', help='Create a new experiment config interactively and run it')
     p.add_argument('--train-only', action='store_true', help='Only run training')
     p.add_argument('--compress-only', action='store_true', help='Only run compression')
@@ -145,10 +145,10 @@ def main():
 
     # Apply CLI overrides
     progress = not args.no_progress and config.get('progress', True)
-    device =  config.get('device', 'cuda' if torch.cuda.is_available() else 'cuda') or args.device
+    device = args.device or config.get('device') or ('cuda' if torch.cuda.is_available() else 'cpu')
     
     print(device)
-    precision = args.precision or config.get('precision', 'fp32')
+    precision = args.precision or config.get('precision') or 'fp32'
     verify = args.verify or bool(config.get('verify', False))
     # Model path can be provided via CLI or config (either top-level 'model_path' or under 'model.path')
     model_path_cfg = config.get('model_path') or config.get('model', {}).get('path')
