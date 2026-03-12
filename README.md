@@ -49,6 +49,63 @@ Useful flags:
 > [!WARNING]  
 Currently training can only be done on a CUDA-Compatible GPU!
 
+## Running on Modal (cloud GPU)
+
+[Modal](https://modal.com) lets you run the full training + compress/decompress pipeline on a cloud GPU without any local GPU setup.
+
+### Prerequisites
+
+1. **Create a Modal account** at [modal.com](https://modal.com) and install the CLI:
+
+```bash
+pip install modal
+modal setup   # authenticates your local machine
+```
+
+2. **Install `uv`** (used to invoke Modal locally):
+
+```bash
+pip install uv
+```
+
+### Running
+
+Dispatch the training job to Modal with a single command:
+
+```bash
+uv run modal run modal_runner.py
+```
+
+This will:
+1. Build a cloud container with CUDA 12.1, PyTorch 2.4, and all Mamba dependencies
+2. Upload your project (excluding `.git`, `.venv`, `__pycache__`)
+3. Run `main.py` inside the container on a T4 GPU
+4. Sync all output files (`.pt`, `.boa`, `.png`, `.yaml`, …) back to your local `experiments/` directory
+
+Progress is streamed to your terminal in real time. When complete, you can find all results under `experiments/cms_experiment/`.
+
+### Re-training
+
+After a successful run, `main.py` writes `model_path` into the YAML so subsequent runs load the checkpoint and skip training. To **force a fresh training run**, remove that line from your config:
+
+```yaml
+# cms_experiment.yaml — remove this line to re-train:
+# model_path: cms_experiment_final_model_fp32.pt
+```
+
+### Customising the GPU
+
+The default GPU is a T4. To use a different GPU, edit `modal_runner.py`:
+
+```python
+@app.function(image=image, gpu="A10G", timeout=86400)  # or "A100", "H100", etc.
+```
+
+See the [Modal GPU docs](https://modal.com/docs/guide/gpu) for available options and pricing.
+
+> [!WARNING]  
+Currently training can only be done on a CUDA-Compatible GPU!
+
 ## Config file structure
 
 A minimal example (`configs/experiment.yaml`):
