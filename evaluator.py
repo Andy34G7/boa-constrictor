@@ -10,7 +10,6 @@ from sklearn.calibration import calibration_curve
 from collections import defaultdict
 import json
 from datetime import datetime
-from mamba_ssm import Mamba
 from matplotlib.lines import Line2D
 import pandas as pd
 
