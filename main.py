@@ -55,7 +55,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Run BoaConstrictor experiments from a config file")
     p.add_argument('--config', '-c', type=Path, required=False, help='Path to YAML experiment config')
     p.add_argument('--no-progress', action='store_true', help='Disable progress bars')
-    p.add_argument('--device', type=str, default="cuda", help='Torch device override (cpu|cuda)')
+    p.add_argument('--device', type=str, default=None, help='Torch device override (cpu|cuda). Takes priority over the config file.')
     p.add_argument('--precision', type=str, default="fp32", choices=['fp32','fp16', 'fp8'], help='Precision override')
     p.add_argument('--new-experiment', action='store_true', help='Create a new experiment config interactively and run it')
     p.add_argument('--train-only', action='store_true', help='Only run training')
@@ -145,7 +145,8 @@ def main():
 
     # Apply CLI overrides
     progress = not args.no_progress and config.get('progress', True)
-    device =  config.get('device', 'cuda' if torch.cuda.is_available() else 'cuda') or args.device
+    # CLI --device takes priority over config; config takes priority over auto-detect
+    device = args.device or config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
     
     print(device)
     precision = args.precision or config.get('precision', 'fp32')
@@ -544,7 +545,7 @@ def main():
 
     # Note: configs are stored under experiments/<name>/<name>.yaml when created
     # and can be referenced by experiment name via --config <name>. No copy is necessary.
-    if (args.evaluate or args.evaluate_only) and torch.cuda.is_available():
+    if (args.evaluate or args.evaluate_only):
         from evaluator import CompressionEvaluator
         print("Starting evaluation...")
         print("Loading model and data...")
@@ -608,9 +609,7 @@ def main():
         except Exception as e:
             print(f"[WARN] Failed to generate bit-exact columns plot: {e}")
         print("Evaluation complete.")
-    elif not torch.cuda.is_available() and (args.evaluate or args.evaluate_only):
-        print("[WARN] Evaluation requires CUDA; skipping evaluation as no CUDA device is available.")
-        
+
     if args.show_timings:
         print('\nTimings:')
         for k, v in timings.items():
