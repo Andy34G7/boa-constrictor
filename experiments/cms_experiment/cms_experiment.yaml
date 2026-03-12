@@ -9,6 +9,7 @@ file_path: CMS_DATA_float32.bin
 model:
   d_model: 256
   num_layers: 1
+model_path: cms_experiment_final_model_fp32.pt
 name: cms_experiment
 precision: fp32
 progress: true
