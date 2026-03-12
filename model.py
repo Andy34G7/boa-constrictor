@@ -35,7 +35,7 @@ class BoaBytePredictor_LSTM(nn.Module):
         caches[1] = new_c
         return self.head(out.squeeze(1))
 
-def BoaConstrictor_LSTM(d_model=256, num_layers=4, vocab_size=256, device="cuda"):
+def BoaConstrictor(d_model=256, num_layers=4, vocab_size=256, device="cuda"):
     """ Construct a BoaBytePredictor with smaller model size for Boa experiments. """
     device = "cuda" if torch.cuda.is_available() and device == "cuda" else "cpu"
     return BoaBytePredictor_LSTM(d_model, num_layers, vocab_size).to(device)
