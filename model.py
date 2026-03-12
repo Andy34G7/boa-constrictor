@@ -2,136 +2,45 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-def BoaConstrictor(d_model=256, num_layers=4, vocab_size=256, device="cuda"):
+class BoaBytePredictor_LSTM(nn.Module):
+    """ LSTM model adapted to predict the next byte in a sequence. """
+    def __init__(self, d_model=256, num_layers=4, vocab_size=256):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.lstm = nn.LSTM(input_size=d_model, hidden_size=d_model, num_layers=num_layers, batch_first=True)
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, vocab_size)
+        )
+
+    def forward(self, x, inference_params=None):
+        out, _ = self.lstm(self.embedding(x))
+        return self.head(out)
+        
+    @torch.inference_mode()
+    def init_stream(self, max_len: int, batch_size: int = 1, device=None, dtype=None):
+        device = device or self.embedding.weight.device
+        h_0 = torch.zeros(self.lstm.num_layers, batch_size, self.lstm.hidden_size, device=device)
+        c_0 = torch.zeros(self.lstm.num_layers, batch_size, self.lstm.hidden_size, device=device)
+        # Return a list instead of a tuple so that codec.py can just update the logits with a single call.
+        return [h_0, c_0]
+
+    @torch.inference_mode()
+    def step(self, byte_t: torch.LongTensor, caches) -> torch.Tensor:
+        # LSTM expects a tuple (h, c)
+        out, (new_h, new_c) = self.lstm(self.embedding(byte_t).unsqueeze(1), (caches[0], caches[1]))  
+        # Mutate the caller's list in-place to carry the state forward
+        caches[0] = new_h
+        caches[1] = new_c
+        return self.head(out.squeeze(1))
+
+def BoaConstrictor_LSTM(d_model=256, num_layers=4, vocab_size=256, device="cuda"):
     """ Construct a BoaBytePredictor with smaller model size for Boa experiments. """
-    IS_CUDA = torch.cuda.is_available() and device == "cuda"
+    device = "cuda" if torch.cuda.is_available() and device == "cuda" else "cpu"
+    return BoaBytePredictor_LSTM(d_model, num_layers, vocab_size).to(device)
 
-    if IS_CUDA:
-        device = "cuda"
-        from mamba_ssm import Mamba
-        from mamba_ssm.utils.generation import InferenceParams
-    else:
-        device = "cpu"
-        from mambapy.mamba import MambaBlock as MambaCPU, MambaConfig
-
-    def tag_mamba_layers_with_ids(model):
-        """Give each Mamba layer a unique .layer_idx (0..N-1) for streaming cache."""
-        i = 0
-        for m in model.modules():
-            if IS_CUDA:
-                if isinstance(m, Mamba):
-                    setattr(m, "layer_idx", i)
-                    i += 1
-            else:
-                if isinstance(m, MambaCPU):
-                    setattr(m, "layer_idx", i)
-                    i += 1
-
-    def bump_offset(inf, k: int = 1):
-        # Most builds use seqlen_offset
-        if hasattr(inf, "seqlen_offset"):
-            inf.seqlen_offset += k
-        elif hasattr(inf, "sequence_length_offset"):
-            setattr(inf, "sequence_length_offset", getattr(inf, "sequence_length_offset") + k)
-        else:
-            # set a best-effort attribute for obscure builds
-            setattr(inf, "seqlen_offset", getattr(inf, "seqlen_offset", 0) + k)
-
-
-    # ---------- Model blocks that pass inference_params ----------
-    class MambaBlock(nn.Module):
-        def __init__(self, d_model: int):
-            super().__init__()
-            self.ln1 = nn.LayerNorm(d_model)
-            if IS_CUDA:
-                self.mamba = Mamba(d_model=d_model)
-            else:
-                config = MambaConfig(d_model=d_model, n_layers=0, use_cuda=False)
-                self.mamba = MambaCPU(config)
-            self.ln2 = nn.LayerNorm(d_model)
-            self.ff = nn.Sequential(
-                nn.Linear(d_model, 4 * d_model),
-                nn.GELU(),
-                nn.Linear(4 * d_model, d_model),
-            )
-        def forward(self, x, inference_params=None):
-            y = self.ln1(x)
-            if IS_CUDA:
-                y = self.mamba(y, inference_params=inference_params)  # <-- stream cache
-            else:
-                y = self.mamba(y)  # no stream cache in CPU version
-            y = self.ln2(y)
-            y = self.ff(y)
-            return x + y
-        
-        if not IS_CUDA:
-            def init_cache(self, batch_size: int, device):
-                # cache for mambapy.MambaBlock.step: (h, inputs)
-                d_inner = self.mamba.config.d_inner
-                d_conv = self.mamba.config.d_conv
-                inputs = torch.zeros(batch_size, d_inner, d_conv - 1, device=device)
-                return (None, inputs)
-
-            def step(self, x, cache):
-                # x: [B, D] -> [B, D], cache passthrough
-                y = self.ln1(x)
-                y, cache = self.mamba.step(y, cache)  # mambapy step
-                y = self.ln2(y)
-                y = self.ff(y)
-                return x + y, cache
-        
-    class BoaBytePredictor(nn.Module):
-        """ Mamba model adapted to predict the next byte in a sequence. """
-        def __init__(self, d_model=256, num_layers=4, vocab_size=256):
-            super().__init__()
-            # Embedding for vocab_size possible bytes
-            self.embedding = nn.Embedding(vocab_size, d_model)
-            self.blocks = nn.ModuleList([MambaBlock(d_model) for _ in range(num_layers)])
-            self.head = nn.Sequential(
-                nn.Linear(d_model, d_model),
-                nn.ReLU(),
-                # Output logits for each of the vocab_size possible next bytes
-                nn.Linear(d_model, vocab_size)
-            )
-
-        def forward(self, x, inference_params=None):
-            h = self.embedding(x)  # [B, L, D]
-            for blk in self.blocks:
-                h = blk(h, inference_params=inference_params)
-            return self.head(h)  # [B, L, 256]
-        
-        if IS_CUDA:
-            @torch.inference_mode()
-            def init_stream(self, max_len: int, batch_size: int = 1, device=None, dtype=None):
-                return InferenceParams(max_batch_size=batch_size, max_seqlen=max_len)
-
-            @torch.inference_mode()
-            def step(self, byte_t: torch.LongTensor, inf) -> torch.Tensor:
-                # byte_t: [B]
-                x = self.embedding(byte_t).unsqueeze(1)  # [B, 1, D]
-                h = x
-                for blk in self.blocks:
-                    h = blk(h, inference_params=inf)      # O(1) per token (cached)
-                logits_next = self.head(h).squeeze(1)     # [B, vocab_size]
-                bump_offset(inf, 1)                       # advance stream
-                return logits_next
-        else:
-            @torch.inference_mode()
-            def init_stream(self, max_len: int, batch_size: int = 1, device=None, dtype=None):
-                # returns list of per-block caches
-                return [blk.init_cache(batch_size, device) for blk in self.blocks]
-
-            @torch.inference_mode()
-            def step(self, byte_t: torch.LongTensor, caches) -> torch.Tensor:
-                # byte_t: [B] -> logits: [B, 256]
-                h = self.embedding(byte_t)  # [B, D]
-                for i, blk in enumerate(self.blocks):
-                    h, caches[i] = blk.step(h, caches[i])  # O(1) per token with cache
-                logits_next = self.head(h)  # [B, vocab_size]
-                return logits_next
-    model = BoaBytePredictor(d_model=d_model, num_layers=num_layers, vocab_size=vocab_size)
-    tag_mamba_layers_with_ids(model)
-    return model
+# These shouldn't require any changes (I hope)
 
 def _aligned_len(n_bytes: int, seq_len: int, batch_size: int) -> int:
     # number of usable bytes that fit whole (batch_size * seq_len) chunks
