@@ -5,9 +5,30 @@ import subprocess
 app = modal.App("boa-constrictor")
 
 # Base image with Python 3.11, Nvidia CUDA Compiler (NVCC) and PyTorch/dependencies.
+# We install torch first, then mamba-ssm/causal-conv1d from pre-built GitHub release wheels
+# to avoid source compilation failures in the Modal build environment.
+TORCH_VERSION = "2.4.0+cu121"
+CAUSAL_CONV1D_WHEEL = (
+    "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.5.2/"
+    "causal_conv1d-1.5.2%2Bcu12torch2.4cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+)
+MAMBA_SSM_WHEEL = (
+    "https://github.com/state-spaces/mamba/releases/download/v2.2.5/"
+    "mamba_ssm-2.2.5%2Bcu12torch2.4cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+)
+
 image = (
     modal.Image.from_registry("nvidia/cuda:12.1.0-devel-ubuntu22.04", add_python="3.11")
     .apt_install("git", "build-essential", "ninja-build")
+    # 1. Install PyTorch first so mamba can find it during its own install
+    .pip_install(
+        f"torch=={TORCH_VERSION}",
+        "torchvision==0.19.0+cu121",
+        extra_index_url="https://download.pytorch.org/whl/cu121"
+    )
+    # 2. Install mamba-ssm and causal-conv1d from pre-built wheels (no source compile needed)
+    .pip_install(CAUSAL_CONV1D_WHEEL, MAMBA_SSM_WHEEL)
+    # 3. Install remaining requirements (excluding torch, mamba-ssm, causal-conv1d)
     .pip_install_from_requirements("requirements.txt")
     .add_local_dir(
         ".", 
