@@ -11,7 +11,7 @@ model:
   num_layers: 1
 model_path: cms_experiment_final_model_fp32.pt
 name: cms_experiment
-precision: fp32
+precision: fp16
 progress: true
 splits:
 - 0.8
