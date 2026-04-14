@@ -1,6 +1,8 @@
 import modal
 import os
+import shlex
 import subprocess
+from pathlib import Path
 
 app = modal.App("boa-constrictor")
 
@@ -38,10 +40,11 @@ image = (
 )
 
 @app.function(image=image, gpu="T4", timeout=86400)
-def train_and_sync(args: list[str]):
+def train_and_sync(args: list[str], pipeline: str = "boa"):
     os.chdir("/app")
-    
-    cmd = ["python", "main.py"] + args
+
+    script = "main_hydra.py" if pipeline == "hydra" else "main.py"
+    cmd = ["python", script] + args
     print(f"Running in Modal: {' '.join(cmd)}")
     
     # Execute the training pipeline in the container
@@ -52,10 +55,11 @@ def train_and_sync(args: list[str]):
     if "--config" in args:
         config_idx = args.index("--config")
         if config_idx + 1 < len(args):
-            exp_name = os.path.basename(os.path.dirname(args[config_idx + 1]))
-            # If standard config path like config/my_exp.yaml
-            if exp_name == "configs" or exp_name == ".":
-                exp_name = os.path.splitext(os.path.basename(args[config_idx + 1]))[0]
+            cfg_path = Path(args[config_idx + 1])
+            exp_name = cfg_path.parent.name
+            # If config path is flat like configs/my_exp.yaml
+            if exp_name in {"configs", ".", ""}:
+                exp_name = cfg_path.stem
 
     # Collect all experiment result files to send back to the local machine
     exp_dir = f"experiments/{exp_name}"
@@ -74,11 +78,33 @@ def train_and_sync(args: list[str]):
 
 @app.local_entrypoint()
 def main():
-    # Pass arguments needed to run main.py inside the container
-    args = ["--config", "experiments/cms_experiment/cms_experiment.yaml"]
+    # Choose pipeline: "boa" (default) or "hydra"
+    pipeline = os.environ.get("BOA_PIPELINE", "boa").strip().lower()
+    if pipeline not in {"boa", "hydra"}:
+        raise ValueError("BOA_PIPELINE must be 'boa' or 'hydra'")
+
+    # Args passed to selected script inside the container.
+    # - BOA pipeline uses config YAML.
+    # - Hydra pipeline uses main_hydra.py flags.
+    if pipeline == "hydra":
+        args = [
+            "--device", "cuda",
+            "--epochs", "10",
+            "--K", "4",
+            "--save-checkpoint", "experiments/cms_experiment/hydra_final_model.pt",
+        ]
+    else:
+        args = ["--config", "experiments/cms_experiment/cms_experiment.yaml"]
+
+    # Optional override for script arguments without editing this file.
+    # Example:
+    #   BOA_ARGS='--device cuda --epochs 20 --K 8 --save-checkpoint experiments/cms_experiment/hydra_k8.pt'
+    args_override = os.environ.get("BOA_ARGS", "").strip()
+    if args_override:
+        args = shlex.split(args_override)
     
-    print("Dispatching training job to Modal...")
-    results = train_and_sync.remote(args)
+    print(f"Dispatching {pipeline} job to Modal...")
+    results = train_and_sync.remote(args, pipeline=pipeline)
     
     print(f"\nJob completed! Syncing {len(results)} output files back to local workspace...")
     for filepath, data in results.items():
