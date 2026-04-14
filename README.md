@@ -3,12 +3,14 @@
 This repo provides a byte-level compression pipeline driven by a neural predictor (BoaConstrictor) and entropy coding (range coding). It includes:
 
 - A clean CLI to train a model, compress with it, and decompress back
+- An additional HydraBOA pipeline for chunked multi-head byte prediction
 - Per-experiment YAML configs and an interactive config creator
 - Optional progress bars and timing for each major stage
 - CPU and GPU execution, with tips for best performance
 
 Key entrypoints:
 - CLI: `main.py`
+- Hydra CLI: `main_hydra.py`
 - Example config: `experiments/cms_experiment/cms_experiment.yaml`
 
 > [!NOTE]  
@@ -46,6 +48,37 @@ Useful flags:
 - `--evaluate`, `--evaluate-only` to evaluate performance of the compression model
 - `--comparison-baseline-only` to run LZMA and ZLIB on the dataset as baselines
 
+## HydraBOA quick usage
+
+HydraBOA is provided as a separate entrypoint and model/codec pair:
+
+- `main_hydra.py`
+- `hydra_model.py`
+- `hydra_codec.py`
+
+Local smoke test (CPU):
+
+```bash
+python3 main_hydra.py --device cpu --epochs 2
+```
+
+Local run (CUDA + optional GPU range coder):
+
+```bash
+python3 main_hydra.py --device cuda --epochs 10 --K 4 --gpu-codec
+```
+
+Use a real file and save a checkpoint:
+
+```bash
+python3 main_hydra.py \
+  --device cuda \
+  --data-path /path/to/dataset.bin \
+  --epochs 20 \
+  --K 4 \
+  --save-checkpoint experiments/cms_experiment/hydra_final_model.pt
+```
+
 > [!WARNING]  
 Currently training can only be done on a CUDA-Compatible GPU!
 
@@ -70,16 +103,36 @@ pip install uv
 
 ### Running
 
-Dispatch the training job to Modal with a single command:
+Dispatch the default BOA pipeline job to Modal with:
 
 ```bash
 uv run modal run modal_runner.py
 ```
 
+Run HydraBOA on Modal:
+
+```bash
+BOA_PIPELINE=hydra uv run modal run modal_runner.py
+```
+
+Pass custom arguments to the selected pipeline with `BOA_ARGS`:
+
+```bash
+BOA_PIPELINE=hydra \
+BOA_ARGS="--device cuda --epochs 20 --K 8 --save-checkpoint experiments/cms_experiment/hydra_k8.pt" \
+uv run modal run modal_runner.py
+```
+
+Switch explicitly back to BOA:
+
+```bash
+BOA_PIPELINE=boa uv run modal run modal_runner.py
+```
+
 This will:
 1. Build a cloud container with CUDA 12.1, PyTorch 2.4, and all Mamba dependencies
 2. Upload your project (excluding `.git`, `.venv`, `__pycache__`)
-3. Run `main.py` inside the container on a T4 GPU
+3. Run `main.py` (BOA) or `main_hydra.py` (HydraBOA) inside the container on a T4 GPU
 4. Sync all output files (`.pt`, `.boa`, `.png`, `.yaml`, …) back to your local `experiments/` directory
 
 Progress is streamed to your terminal in real time. When complete, you can find all results under `experiments/cms_experiment/`.
