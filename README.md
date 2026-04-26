@@ -48,6 +48,79 @@ Useful flags:
 - `--evaluate`, `--evaluate-only` to evaluate performance of the compression model
 - `--comparison-baseline-only` to run LZMA and ZLIB on the dataset as baselines
 
+## Working with experiments (recommended workflow)
+
+This section explains the most common workflows and how metrics/checkpoints are mapped.
+
+### 1) Compare pipeline (default)
+
+Run:
+
+```bash
+uv run modal run modal_runner.py
+```
+
+Behavior:
+- Trains BOA first only if the canonical checkpoint is missing.
+- BOA training is launched with `--train-only` to create a checkpoint.
+- BOA compression/decompression is then run in a second step using the canonical checkpoint.
+- Hydra compare run is executed after BOA and writes to the same metrics CSV.
+
+So logs that show `--train-only` are expected in compare mode: compression starts after that training step completes.
+
+### 2) BOA sweep mode from template CSV
+
+Run:
+
+```bash
+BOA_PIPELINE=boa BOA_SWEEP_MODELS=1 uv run modal run modal_runner.py
+```
+
+Behavior:
+- Reads model names from `experiments/<exp_name>/model_metrics_template.csv`.
+- For each row, expects a checkpoint named `experiments/<exp_name>/<model_name>.pt`.
+- If missing, it now auto-trains a checkpoint from that row name and then runs compression/decompression.
+
+Supported row-name hints for auto-training:
+- Backbones: `mambav1`, `mambav2`, `MinGRU`
+- Width: patterns like `_128dm_` or `_160MinGRU`
+- Depth/epochs: patterns like `_64_2_20ep` or `_30epoch`
+
+### 3) Selecting backbone in config
+
+You can select BOA backbone explicitly:
+
+```yaml
+model:
+  d_model: 256
+  num_layers: 1
+  backbone: mambav1   # one of: mambav1, mambav2, mingru
+```
+
+Notes:
+- If `mambav2` is requested but unavailable in the runtime, BOA falls back to `mambav1` with a warning.
+- `mingru` is supported for both training and streaming compression/decompression.
+
+### 4) Understanding metrics CSV rows
+
+Metrics rows are keyed by `model` name, not by experiment name.
+
+Implications:
+- `cms_experiment_boa_main` and `cms_experiment_final_model_fp16` are different rows and can have very different ratios.
+- A log line like `Compression ratio: 4.13` can be correct while another row still shows `0.98` (that is a different model key).
+- The printed ratio in logs is rounded (2 decimals), while CSV stores full precision.
+
+### 5) Train ratio vs actual compressed ratio
+
+During training, progress bars print an estimated ratio from model loss (`8 / bpp`).
+That is not the final file ratio.
+
+Final compression ratio is computed from real output bytes:
+
+`compression_ratio = original_size / compressed_size`
+
+Trust the final compression/decompression metrics written to CSV for model comparison.
+
 ## HydraBOA quick usage
 
 HydraBOA is provided as a separate entrypoint and model/codec pair:
