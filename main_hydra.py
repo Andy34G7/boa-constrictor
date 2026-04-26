@@ -13,9 +13,12 @@ Usage:
 """
 
 import argparse
+import csv
 import hashlib
 import os
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -101,6 +104,48 @@ def train_hydra(model, data: np.ndarray, *,
 
 
 def main():
+    def _upsert_metrics_row(csv_path: Path, row: dict, key_col: str = "model") -> None:
+        if key_col not in row or not str(row.get(key_col, "")).strip():
+            return
+
+        rows = []
+        fields = []
+        if csv_path.exists():
+            with open(csv_path, "r", newline="") as f:
+                reader = csv.DictReader(f)
+                fields = list(reader.fieldnames or [])
+                rows = list(reader)
+
+        preferred = [
+            "model", "compression_ratio", "throughput_compress_MBps",
+            "throughput_decompress_MBps", "original_size", "compressed_size",
+            "time_compress_s", "time_decompress_s", "experiment",
+            "checkpoint_path", "updated_at_utc",
+        ]
+        merged_fields = []
+        for c in preferred + fields + list(row.keys()):
+            if c not in merged_fields:
+                merged_fields.append(c)
+
+        key = str(row[key_col]).strip()
+        found = False
+        for r in rows:
+            if str(r.get(key_col, "")).strip() == key:
+                r.update({k: "" if v is None else str(v) for k, v in row.items()})
+                found = True
+                break
+        if not found:
+            nr = {c: "" for c in merged_fields}
+            nr.update({k: "" if v is None else str(v) for k, v in row.items()})
+            rows.append(nr)
+
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=merged_fields)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow({c: r.get(c, "") for c in merged_fields})
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--epochs", type=int, default=15)
@@ -125,6 +170,14 @@ def main():
                     help="Use GPU range coder for compress/decompress.")
     ap.add_argument("--save-checkpoint", type=str, default=None,
                     help="Path to save model checkpoint (.pt) after training.")
+    ap.add_argument("--load-checkpoint", type=str, default=None,
+                    help="Path to load model checkpoint (.pt) and skip training.")
+    ap.add_argument("--train-only", action="store_true",
+                    help="Only train the model and save checkpoint, then exit.")
+    ap.add_argument("--metrics-csv", type=str, default=None,
+                    help="Optional CSV path to upsert compare metrics row.")
+    ap.add_argument("--metrics-model-name", type=str, default=None,
+                    help="Optional model name key for metrics CSV row.")
     args = ap.parse_args()
 
     K = args.K
@@ -171,20 +224,34 @@ def main():
     print(f"  Parameters : {n_params:,}")
 
     # ── 3. Train ──
-    final_bpp = train_hydra(
-        model, data,
-        seq_len=args.seq_len,
-        batch_size=args.batch_size,
-        num_epochs=args.epochs,
-        device=device,
-        K=K,
-        lr=args.lr,
-        precision=args.precision,
-        use_compile=args.compile,
-    )
+    skipped_training = False
+    final_bpp = 0.0
+    if args.load_checkpoint:
+        ckpt_path = Path(args.load_checkpoint)
+        if ckpt_path.exists():
+            print(f"  [INFO] Loading checkpoint from {ckpt_path}")
+            ckpt = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(ckpt["model_state_dict"])
+            final_bpp = ckpt.get("final_bpp", 0.0)
+            skipped_training = True
+        else:
+            print(f"  [WARN] Checkpoint not found at {ckpt_path}, will train from scratch.")
+
+    if not skipped_training:
+        final_bpp = train_hydra(
+            model, data,
+            seq_len=args.seq_len,
+            batch_size=args.batch_size,
+            num_epochs=args.epochs,
+            device=device,
+            K=K,
+            lr=args.lr,
+            precision=args.precision,
+            use_compile=args.compile,
+        )
 
     # ── 3b. Save checkpoint ──
-    if args.save_checkpoint:
+    if args.save_checkpoint and not skipped_training:
         ckpt_dir = os.path.dirname(args.save_checkpoint)
         if ckpt_dir:
             os.makedirs(ckpt_dir, exist_ok=True)
@@ -202,6 +269,10 @@ def main():
         }
         torch.save(ckpt, args.save_checkpoint)
         print(f"  Checkpoint saved → {args.save_checkpoint}")
+
+    if args.train_only:
+        print("  [INFO] --train-only specified, exiting after training.")
+        return 0
 
     # ── 4. Compress ──
     # When test-bytes=0, compress the FULL file (not just training slice)
@@ -255,6 +326,29 @@ def main():
     dec_mbs = len(decompressed) / 1e6 / max(t_dec, 1e-9)
     print(f"  Decompressed : {len(decompressed):,} bytes")
     print(f"  Dec. time    : {t_dec:.3f}s  ({dec_mbs:.2f} MB/s)")
+
+    if args.metrics_csv:
+        ckpt_stem = Path(args.save_checkpoint).stem if args.save_checkpoint else "hydra_main"
+        model_name = args.metrics_model_name or ckpt_stem
+        experiment = ""
+        if args.save_checkpoint:
+            p = Path(args.save_checkpoint)
+            experiment = p.parent.parent.parent.name if len(p.parents) >= 3 else p.parent.name
+        row = {
+            "model": model_name,
+            "compression_ratio": f"{ratio:.6f}",
+            "throughput_compress_MBps": f"{comp_mbs:.6f}",
+            "throughput_decompress_MBps": f"{dec_mbs:.6f}",
+            "original_size": str(len(test_data)),
+            "compressed_size": str(comp_bytes),
+            "time_compress_s": f"{t_comp:.6f}",
+            "time_decompress_s": f"{t_dec:.6f}",
+            "experiment": experiment,
+            "checkpoint_path": str(Path(args.save_checkpoint).resolve()) if args.save_checkpoint else "",
+            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        _upsert_metrics_row(Path(args.metrics_csv), row)
+        print(f"  [INFO] Updated metrics CSV: {args.metrics_csv}")
 
     # ── 6. Verify ──
     sha_orig = hashlib.sha256(test_data).hexdigest()

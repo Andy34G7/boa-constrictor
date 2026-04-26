@@ -58,7 +58,7 @@ def parse_args():
     p.add_argument('--config', '-c', type=Path, required=False, help='Path to YAML experiment config')
     p.add_argument('--no-progress', action='store_true', help='Disable progress bars')
     p.add_argument('--device', type=str, default=None, help='Torch device override (cpu|cuda). Takes priority over the config file.')
-    p.add_argument('--precision', type=str, default="fp32", choices=['fp32','fp16', 'fp8'], help='Precision override')
+    p.add_argument('--precision', type=str, default=None, choices=['fp32','fp16', 'fp8'], help='Precision override')
     p.add_argument('--new-experiment', action='store_true', help='Create a new experiment config interactively and run it')
     p.add_argument('--train-only', action='store_true', help='Only run training')
     p.add_argument('--compress-only', action='store_true', help='Only run compression')
@@ -213,11 +213,13 @@ def main():
             cfg_dir = Path.cwd()
         if not model_path.is_absolute():
             model_path = (cfg_dir / model_path).resolve()
+        if not model_path.exists():
+            print(f"[WARN] Configured model path does not exist: {model_path}. Training a new model.")
+            model_path = None
 
     # Experiment parameters (with sensible defaults)
-    # Use the config filename stem as the canonical experiment/model name
-    # so checkpoints are consistently named and retraining can be skipped.
-    name = Path(args.config).stem
+    # Prefer explicit config name; fallback to config filename stem.
+    name = str(config.get('name') or Path(args.config).stem)
     file_path = config.get('file_path', '')
     # Resolve file_path: if it's absolute, use as-is; if relative, interpret
     # it relative to the directory of the resolved config file (so passing
@@ -235,6 +237,7 @@ def main():
     batch_size = config.get('dataloader', {}).get('batch_size', 3)
     d_model = config.get('model', {}).get('d_model', 256)
     num_layers = config.get('model', {}).get('num_layers', 8)
+    backbone = str(config.get('model', {}).get('backbone', 'mambav1'))
     lr = float(config.get('training', {}).get('lr', 5e-4))
     num_epochs = config.get('training', {}).get('epochs', 50)
     use_vocab_subset = config.get('use_vocab_subset', False)
@@ -297,7 +300,14 @@ def main():
     exp_dir.mkdir(parents=True, exist_ok=True)
 
     # Setup model, dataloaders, optimizer, loss
-    model = BoaConstrictor(d_model=d_model, num_layers=num_layers, vocab_size=vocab_size, device=device)
+    print(f"Using model backbone: {backbone} (d_model={d_model}, num_layers={num_layers})")
+    model = BoaConstrictor(
+        d_model=d_model,
+        num_layers=num_layers,
+        vocab_size=vocab_size,
+        device=device,
+        backbone=backbone,
+    )
 
     dataloader = ByteDataloader(data_bytes, seq_len=seq_len, batch_size=batch_size, device=device)
 
@@ -381,11 +391,17 @@ def main():
     model_label = Path(model_path).stem if model_path is not None else f"{name}_final_model_{precision}"
     model_checkpoint_path = str(model_path) if model_path is not None else str(default_ckpt)
     metrics_csv_path = _select_metrics_csv_path(exp_dir)
+    print(f"[INFO] Metrics CSV target: {metrics_csv_path}")
     run_metrics = {
         'model': model_label,
         'experiment': name,
         'checkpoint_path': model_checkpoint_path,
     }
+
+    will_compress = (not args.train_only and not args.decompress_only and not args.evaluate_only)
+    will_decompress = (not args.train_only and not args.compress_only and not args.evaluate_only)
+    if not will_compress and not will_decompress:
+        print("[INFO] Metrics CSV not updated in this run because both compression and decompression are disabled by flags.")
 
     if not args.compress_only and not args.decompress_only and not args.comparison_baseline_only:
         if model_path is None or resume_training:
@@ -561,8 +577,8 @@ def main():
             run_metrics.update({
                 'compression_ratio': f"{compression_ratio:.6f}",
                 'throughput_compress_MBps': f"{comp_throughput:.6f}",
-                'original_size': original_size,
-                'compressed_size': boa_size,
+                'original_size': str(original_size),
+                'compressed_size': str(boa_size),
                 'time_compress_s': f"{timings['compression']:.6f}",
                 'updated_at_utc': datetime.now(timezone.utc).isoformat(),
             })

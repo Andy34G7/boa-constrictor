@@ -2,17 +2,22 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-def BoaConstrictor(d_model=256, num_layers=4, vocab_size=256, device="cuda"):
+def BoaConstrictor(d_model=256, num_layers=4, vocab_size=256, device="cuda", backbone="mambav1"):
     """ Construct a BoaBytePredictor with smaller model size for Boa experiments. """
     IS_CUDA = torch.cuda.is_available() and device == "cuda"
 
     if IS_CUDA:
         device = "cuda"
         from mamba_ssm import Mamba
+        try:
+            from mamba_ssm import Mamba2
+        except Exception:
+            Mamba2 = None
         from mamba_ssm.utils.generation import InferenceParams
     else:
         device = "cpu"
         from mambapy.mamba import MambaBlock as MambaCPU, MambaConfig
+        Mamba2 = None
 
     def tag_mamba_layers_with_ids(model):
         """Give each Mamba layer a unique .layer_idx (0..N-1) for streaming cache."""
@@ -26,6 +31,21 @@ def BoaConstrictor(d_model=256, num_layers=4, vocab_size=256, device="cuda"):
                 if isinstance(m, MambaCPU):
                     setattr(m, "layer_idx", i)
                     i += 1
+
+    def _normalize_backbone(name: str) -> str:
+        n = str(name or "mambav1").strip().lower().replace("_", "")
+        if n in {"mamba", "mambav1", "v1"}:
+            return "mambav1"
+        if n in {"mambav2", "v2"}:
+            return "mambav2"
+        if n in {"mingru", "minigr", "min-gru"}:
+            return "mingru"
+        return "mambav1"
+
+    backbone_name = _normalize_backbone(backbone)
+    if backbone_name == "mambav2" and IS_CUDA and Mamba2 is None:
+        print("[WARN] mambav2 requested but Mamba2 is unavailable; falling back to mambav1")
+        backbone_name = "mambav1"
 
     def bump_offset(inf, k: int = 1):
         # Most builds use seqlen_offset
@@ -79,14 +99,93 @@ def BoaConstrictor(d_model=256, num_layers=4, vocab_size=256, device="cuda"):
                 y = self.ln2(y)
                 y = self.ff(y)
                 return x + y, cache
+
+    class MambaBlockV2(nn.Module):
+        def __init__(self, d_model: int):
+            super().__init__()
+            self.ln1 = nn.LayerNorm(d_model)
+            if IS_CUDA and Mamba2 is not None:
+                self.mamba = Mamba2(d_model=d_model)
+            elif IS_CUDA:
+                self.mamba = Mamba(d_model=d_model)
+            else:
+                config = MambaConfig(d_model=d_model, n_layers=0, use_cuda=False)
+                self.mamba = MambaCPU(config)
+            self.ln2 = nn.LayerNorm(d_model)
+            self.ff = nn.Sequential(
+                nn.Linear(d_model, 4 * d_model),
+                nn.GELU(),
+                nn.Linear(4 * d_model, d_model),
+            )
+
+        def forward(self, x, inference_params=None):
+            y = self.ln1(x)
+            if IS_CUDA:
+                y = self.mamba(y, inference_params=inference_params)
+            else:
+                y = self.mamba(y)
+            y = self.ln2(y)
+            y = self.ff(y)
+            return x + y
+
+        if not IS_CUDA:
+            def init_cache(self, batch_size: int, device):
+                d_inner = self.mamba.config.d_inner
+                d_conv = self.mamba.config.d_conv
+                inputs = torch.zeros(batch_size, d_inner, d_conv - 1, device=device)
+                return (None, inputs)
+
+            def step(self, x, cache):
+                y = self.ln1(x)
+                y, cache = self.mamba.step(y, cache)
+                y = self.ln2(y)
+                y = self.ff(y)
+                return x + y, cache
+
+    class MinGRUBlock(nn.Module):
+        def __init__(self, d_model: int):
+            super().__init__()
+            self.ln1 = nn.LayerNorm(d_model)
+            self.gru = nn.GRU(d_model, d_model, batch_first=True)
+            self.gru_cell = nn.GRUCell(d_model, d_model)
+            self.ln2 = nn.LayerNorm(d_model)
+            self.ff = nn.Sequential(
+                nn.Linear(d_model, 4 * d_model),
+                nn.GELU(),
+                nn.Linear(4 * d_model, d_model),
+            )
+
+        def forward(self, x, inference_params=None):
+            y = self.ln1(x)
+            y, _ = self.gru(y)
+            y = self.ln2(y)
+            y = self.ff(y)
+            return x + y
+
+        def init_cache(self, batch_size: int, device):
+            return torch.zeros(batch_size, self.gru.hidden_size, device=device)
+
+        def step(self, x, cache):
+            y = self.ln1(x)
+            h = self.gru_cell(y, cache)
+            y = self.ln2(h)
+            y = self.ff(y)
+            return x + y, h
         
     class BoaBytePredictor(nn.Module):
         """ Mamba model adapted to predict the next byte in a sequence. """
-        def __init__(self, d_model=256, num_layers=4, vocab_size=256):
+        def __init__(self, d_model=256, num_layers=4, vocab_size=256, backbone_name="mambav1"):
             super().__init__()
+            self.backbone_name = backbone_name
             # Embedding for vocab_size possible bytes
             self.embedding = nn.Embedding(vocab_size, d_model)
-            self.blocks = nn.ModuleList([MambaBlock(d_model) for _ in range(num_layers)])
+            if backbone_name == "mingru":
+                block_cls = MinGRUBlock
+            elif backbone_name == "mambav2":
+                block_cls = MambaBlockV2
+            else:
+                block_cls = MambaBlock
+            self.blocks = nn.ModuleList([block_cls(d_model) for _ in range(num_layers)])
             self.head = nn.Sequential(
                 nn.Linear(d_model, d_model),
                 nn.ReLU(),
@@ -103,17 +202,24 @@ def BoaConstrictor(d_model=256, num_layers=4, vocab_size=256, device="cuda"):
         if IS_CUDA:
             @torch.inference_mode()
             def init_stream(self, max_len: int, batch_size: int = 1, device=None, dtype=None):
-                return InferenceParams(max_batch_size=batch_size, max_seqlen=max_len)
+                if self.backbone_name in {"mambav1", "mambav2"}:
+                    return InferenceParams(max_batch_size=batch_size, max_seqlen=max_len)
+                return [blk.init_cache(batch_size, device) for blk in self.blocks]
 
             @torch.inference_mode()
             def step(self, byte_t: torch.LongTensor, inf) -> torch.Tensor:
                 # byte_t: [B]
                 x = self.embedding(byte_t).unsqueeze(1)  # [B, 1, D]
-                h = x
-                for blk in self.blocks:
-                    h = blk(h, inference_params=inf)      # O(1) per token (cached)
+                if self.backbone_name in {"mambav1", "mambav2"}:
+                    h = x
+                    for blk in self.blocks:
+                        h = blk(h, inference_params=inf)      # O(1) per token (cached)
+                    bump_offset(inf, 1)                       # advance stream
+                else:
+                    h = x.squeeze(1)
+                    for i, blk in enumerate(self.blocks):
+                        h, inf[i] = blk.step(h, inf[i])
                 logits_next = self.head(h).squeeze(1)     # [B, vocab_size]
-                bump_offset(inf, 1)                       # advance stream
                 return logits_next
         else:
             @torch.inference_mode()
@@ -129,7 +235,7 @@ def BoaConstrictor(d_model=256, num_layers=4, vocab_size=256, device="cuda"):
                     h, caches[i] = blk.step(h, caches[i])  # O(1) per token with cache
                 logits_next = self.head(h)  # [B, vocab_size]
                 return logits_next
-    model = BoaBytePredictor(d_model=d_model, num_layers=num_layers, vocab_size=vocab_size)
+    model = BoaBytePredictor(d_model=d_model, num_layers=num_layers, vocab_size=vocab_size, backbone_name=backbone_name)
     tag_mamba_layers_with_ids(model)
     return model
 
