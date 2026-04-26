@@ -1,7 +1,9 @@
 import argparse
+import csv
 import os
 import time
 from pathlib import Path
+from datetime import datetime, timezone
 from networkx import config
 import yaml
 import numpy as np
@@ -72,6 +74,56 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    def _select_metrics_csv_path(out_dir: Path) -> Path:
+        template = out_dir / "model_metrics_template.csv"
+        if template.exists():
+            return template
+        return out_dir / "model_metrics.csv"
+
+    def _upsert_metrics_row(csv_path: Path, row: dict, key_col: str = "model") -> None:
+        """Insert or update one metrics row keyed by model name."""
+        if key_col not in row or not str(row.get(key_col, "")).strip():
+            return
+
+        existing_rows = []
+        existing_fields = []
+        if csv_path.exists():
+            with open(csv_path, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                existing_fields = list(reader.fieldnames or [])
+                existing_rows = list(reader)
+
+        preferred = [
+            "model", "compression_ratio", "throughput_compress_MBps",
+            "throughput_decompress_MBps", "original_size", "compressed_size",
+            "time_compress_s", "time_decompress_s", "experiment",
+            "checkpoint_path", "updated_at_utc",
+        ]
+
+        fields = []
+        for col in preferred + existing_fields + list(row.keys()):
+            if col not in fields:
+                fields.append(col)
+
+        key_val = str(row[key_col]).strip()
+        updated = False
+        for r in existing_rows:
+            if str(r.get(key_col, "")).strip() == key_val:
+                r.update({k: "" if v is None else str(v) for k, v in row.items()})
+                updated = True
+                break
+
+        if not updated:
+            new_row = {c: "" for c in fields}
+            new_row.update({k: "" if v is None else str(v) for k, v in row.items()})
+            existing_rows.append(new_row)
+
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            for r in existing_rows:
+                writer.writerow({c: r.get(c, "") for c in fields})
 
     # If user requests a new experiment, run interactive creator and obtain a config path
     if args.new_experiment:
@@ -326,6 +378,15 @@ def main():
         timings['load_model'] = time.perf_counter() - t_start
         print(f"Model loaded in {timings['load_model']:.2f}s")
 
+    model_label = Path(model_path).stem if model_path is not None else f"{name}_final_model_{precision}"
+    model_checkpoint_path = str(model_path) if model_path is not None else str(default_ckpt)
+    metrics_csv_path = _select_metrics_csv_path(exp_dir)
+    run_metrics = {
+        'model': model_label,
+        'experiment': name,
+        'checkpoint_path': model_checkpoint_path,
+    }
+
     if not args.compress_only and not args.decompress_only and not args.comparison_baseline_only:
         if model_path is None or resume_training:
             print(f"Starting training on device=={device}, precision={precision}, epochs={num_epochs}, start_epoch={start_epoch}")
@@ -494,7 +555,19 @@ def main():
             print(f"Compression ratio: {compression_ratio:.2f}")
 
             timings['compression'] = time.perf_counter() - t_start
-            print(f"Compression complete in {timings['compression']:.2f}s")
+            comp_throughput = (original_size / 1e6) / max(timings['compression'], 1e-9)
+            print(f"Compression complete in {timings['compression']:.2f}s ({comp_throughput:.1f} MB/s)")
+
+            run_metrics.update({
+                'compression_ratio': f"{compression_ratio:.6f}",
+                'throughput_compress_MBps': f"{comp_throughput:.6f}",
+                'original_size': original_size,
+                'compressed_size': boa_size,
+                'time_compress_s': f"{timings['compression']:.6f}",
+                'updated_at_utc': datetime.now(timezone.utc).isoformat(),
+            })
+            _upsert_metrics_row(metrics_csv_path, run_metrics)
+            print(f"[INFO] Updated metrics CSV: {metrics_csv_path}")
             
             if temp_compress_path and temp_compress_path.exists():
                 temp_compress_path.unlink()
@@ -520,7 +593,16 @@ def main():
         with open(out_path, 'wb') as outf:
             outf.write(decompressed_bytes)
         timings['decompression'] = time.perf_counter() - t_start
-        print(f"Decompression complete in {timings['decompression']:.2f}s")
+        decomp_throughput = (len(decompressed_bytes) / 1e6) / max(timings['decompression'], 1e-9)
+        print(f"Decompression complete in {timings['decompression']:.2f}s ({decomp_throughput:.1f} MB/s)")
+
+        run_metrics.update({
+            'throughput_decompress_MBps': f"{decomp_throughput:.6f}",
+            'time_decompress_s': f"{timings['decompression']:.6f}",
+            'updated_at_utc': datetime.now(timezone.utc).isoformat(),
+        })
+        _upsert_metrics_row(metrics_csv_path, run_metrics)
+        print(f"[INFO] Updated metrics CSV: {metrics_csv_path}")
 
         # Optional verification: compare decompressed bytes with original compression input
         if verify:
